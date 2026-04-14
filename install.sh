@@ -15,6 +15,7 @@ echo "Usage:"
 echo "  git-graph                    # analyze current repo"
 echo "  git-graph /path/to/repo      # analyze another repo"
 echo "  git-graph /path/to/repo --no-fetch"
+echo "  git-graph /path/to/repo --open"
 echo
 
 case ":${PATH}:" in

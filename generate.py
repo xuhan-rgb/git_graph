@@ -9,7 +9,7 @@ Git 分支拓扑生成器 (通用版)。
 - 单文件自包含 HTML，不依赖任何 CDN
 - 可交互：点击节点看 commit，点击连线展开段内被折叠的提交
 - 水平虚线时间线按日期分隔，每个日期独占一个时间条
-- 默认 git fetch --prune 以获取最新远端状态
+- 默认 git fetch --prune 获取最新远端状态，并自动清理远端已删除的本地 tag
 - 自动从调色板分配颜色；同名的本地/远端分支共享色调
 
 用法
@@ -21,6 +21,7 @@ Git 分支拓扑生成器 (通用版)。
     python generate.py ../repo --active-days 30
     python generate.py ../repo --branches main dev
     python generate.py ../repo --no-fetch
+    python generate.py ../repo --open
     python generate.py ../repo -o /tmp/graph.html
 """
 
@@ -31,6 +32,7 @@ import json
 import subprocess
 import sys
 import time
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -105,6 +107,7 @@ class Config:
     since: str                          # YYYY-MM-DD
     output: Path
     fetch: bool
+    local_only_tags: set = field(default_factory=set)  # 本地独有、未推送的 tag 名
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -131,6 +134,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="HTML 输出路径")
     ap.add_argument("--no-fetch", action="store_true",
                     help="跳过 git fetch，直接用本地 remote-tracking 状态")
+    ap.add_argument("--open", action="store_true",
+                    help="生成后自动在默认浏览器中打开 HTML")
     return ap.parse_args(argv)
 
 
@@ -499,7 +504,9 @@ def build_nodes(
         is_merge = len(c.parents) >= 2
         is_split = len(c.children) >= 2
         is_tip = sha in tips
-        tag_names = parse_tag_names(c.refs)
+        all_tag_names = parse_tag_names(c.refs)
+        tag_names       = [t for t in all_tag_names if t not in cfg.local_only_tags]
+        local_tag_names = [t for t in all_tag_names if t in cfg.local_only_tags]
         tip_names = tips.get(sha, [])
 
         # is_local = 所有 tip 都是本地 ref (没有任何 remote-tracking 指向)
@@ -511,7 +518,7 @@ def build_nodes(
             "merge" if is_merge else
             "split" if is_split else
             "tip"   if is_tip   else
-            "tag"   if tag_names else
+            "tag"   if (tag_names or local_tag_names) else
             "node"
         )
         nodes.append({
@@ -525,6 +532,7 @@ def build_nodes(
             "row": rows[sha],
             "tip_names": tip_names,
             "tag_names": tag_names,
+            "local_tag_names": local_tag_names,
             "branches": sort_branch_names(reach_branches.get(sha, set()), cfg),
             "is_local": is_local,
             "kind": kind,
@@ -788,6 +796,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <span><span class="dot" style="background:#9e9e9e"></span>普通</span>
         <span style="color:#ffab40">◌ 虚线描边 = 本地分支</span>
         <span><span style="background:#ffd54f;color:#2a1f00;padding:1px 5px;border-radius:3px;font-weight:bold;font-size:10px">tag</span> tag 徽章</span>
+        <span><span style="background:#263238;color:#90caf9;padding:1px 5px;border-radius:3px;font-weight:bold;font-size:10px;border:1.5px dashed #90caf9">⬡ tag</span> 本地 tag（未推送）</span>
         <span style="color:#6a7488">┈ 水平虚线 = 日期时间线</span>
         <span class="today-note">今天: __TODAY__</span>
         <span class="hint">普通点击切换分支；Shift+点击进入对比；按住空白处拖动画布</span>
@@ -1229,8 +1238,33 @@ DATA.nodes.forEach(n => {
     cursorX += approxWidth + 4;
   });
 
+  (n.local_tag_names || []).forEach(tag => {
+    const padding = 5;
+    const label = "⬡ " + tag;
+    const approxWidth = label.length * 6.5 + padding * 2;
+    const tagY = y - 9;
+    const rect = el("rect", {
+      x: cursorX, y: tagY,
+      width: approxWidth, height: 18,
+      rx: 3, ry: 3,
+      fill: "#263238", stroke: "#90caf9", "stroke-width": 1.5,
+      "stroke-dasharray": "3,2",
+    });
+    group.appendChild(rect);
+    const tagText = el("text", {
+      x: cursorX + padding, y: tagY + 13,
+      class: "tag-text",
+      "font-size": 11, "font-weight": "bold",
+      fill: "#90caf9", "font-family": "SF Mono, Menlo, monospace",
+    });
+    tagText.style.pointerEvents = "none";
+    tagText.textContent = label;
+    group.appendChild(tagText);
+    cursorX += approxWidth + 4;
+  });
+
   const lbl = el("text", {x: cursorX, y: y + 4, class: "label"});
-  const maxLen = (n.tag_names || []).length ? 36 : 50;
+  const maxLen = ((n.tag_names || []).length || (n.local_tag_names || []).length) ? 36 : 50;
   lbl.textContent = `${n.short}  ${n.subject.slice(0, maxLen)}${n.subject.length > maxLen ? "…" : ""}`;
   group.appendChild(lbl);
 
@@ -1491,8 +1525,104 @@ def render_html(
 # 主入口
 # -----------------------------------------------------------------------------#
 
-def fetch_remotes(repo: Path) -> None:
-    """绘图前同步远端。不带 --tags 以避免人工决策被静默覆盖。"""
+def _get_commit_ts(sha: str, repo: Path) -> int:
+    """返回 SHA（commit 或 annotated tag object）对应 commit 的 unix 时间戳。"""
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", sha + "^{commit}"],
+            check=True, text=True, capture_output=True, cwd=str(repo),
+        )
+        ts = result.stdout.strip()
+        return int(ts) if ts else 0
+    except (subprocess.CalledProcessError, ValueError):
+        return 0
+
+
+def _sync_tags(repo: Path) -> set:
+    """与远端同步 tag，返回本地独有（未推送）的 tag 名集合。
+
+    本地独有 tag → 不删除，原样保留，返回其名称供 HTML 标记
+    两边都有但 SHA 不同：
+      - 远端 commit 更新 → 以远端为准（force 更新本地）
+      - 本地 commit 更新 → 保留本地
+    """
+    remotes = get_remotes(repo)
+
+    # 远端 tag → SHA
+    remote_tag_sha: dict[str, str] = {}
+    for remote in remotes:
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "--tags", "--refs", remote],
+                check=True, text=True, capture_output=True, cwd=str(repo),
+            )
+            for line in result.stdout.split("\n"):
+                if "\t" not in line:
+                    continue
+                sha, ref = line.split("\t", 1)
+                prefix = "refs/tags/"
+                tag = ref[len(prefix):] if ref.startswith(prefix) else ref
+                remote_tag_sha[tag] = sha.strip()
+        except subprocess.CalledProcessError:
+            pass
+
+    # 本地 tag → SHA
+    try:
+        result = subprocess.run(
+            ["git", "tag", "-l", "--format=%(refname:short)\t%(objectname)"],
+            check=True, text=True, capture_output=True, cwd=str(repo),
+        )
+        local_tag_sha: dict[str, str] = {}
+        for line in result.stdout.split("\n"):
+            if "\t" not in line:
+                continue
+            tag, sha = line.split("\t", 1)
+            local_tag_sha[tag] = sha.strip()
+    except subprocess.CalledProcessError:
+        return
+
+    local_only: list[str] = []
+    to_update:  list[str] = []
+    to_keep:    list[str] = []
+
+    for tag in sorted(local_tag_sha):
+        if tag not in remote_tag_sha:
+            local_only.append(tag)                  # 本地独有，不删除
+        elif remote_tag_sha[tag] != local_tag_sha[tag]:
+            local_ts  = _get_commit_ts(local_tag_sha[tag], repo)
+            remote_ts = _get_commit_ts(remote_tag_sha[tag], repo)
+            if remote_ts > local_ts:
+                to_update.append(tag)               # 远端更新 → 覆盖本地
+            else:
+                to_keep.append(tag)                 # 本地更新 → 保留
+
+    if local_only:
+        print(f"Tag sync: {len(local_only)} local-only tag(s) (not on remote, kept):")
+        for tag in local_only:
+            print(f"  local-only: {tag}")
+
+    if to_update:
+        print(f"Tag sync: updating {len(to_update)} tag(s) moved on remote…")
+        for tag in to_update:
+            try:
+                subprocess.run(
+                    ["git", "tag", "-f", tag, remote_tag_sha[tag]],
+                    check=True, text=True, capture_output=True, cwd=str(repo),
+                )
+                print(f"  updated: {tag}  ({local_tag_sha[tag][:8]} → {remote_tag_sha[tag][:8]})")
+            except subprocess.CalledProcessError:
+                print(f"  [warn] could not update: {tag}")
+
+    if to_keep:
+        print(f"Tag sync: keeping {len(to_keep)} local tag(s) newer than remote:")
+        for tag in to_keep:
+            print(f"  kept (local newer): {tag}")
+
+    return set(local_only)
+
+
+def fetch_remotes(repo: Path) -> set:
+    """绘图前同步远端分支，对齐 tag，返回本地独有 tag 名集合。"""
     print("Fetching remotes (git fetch --all --prune)…")
     try:
         out = subprocess.run(
@@ -1505,6 +1635,15 @@ def fetch_remotes(repo: Path) -> None:
         print(f"[warn] git fetch exited with {e.returncode}, 继续使用本地状态")
         if e.stderr:
             print(e.stderr.rstrip())
+
+    return _sync_tags(repo)
+
+
+def open_output(output: Path) -> None:
+    uri = output.resolve().as_uri()
+    print(f"Opening        : {output}")
+    if not webbrowser.open_new_tab(uri):
+        print(f"[warn] 无法自动打开浏览器，请手动打开: {output}")
 
 
 def build_config(args: argparse.Namespace) -> Config:
@@ -1551,14 +1690,16 @@ def build_config(args: argparse.Namespace) -> Config:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
+    local_only_tags: set = set()
     if not args.no_fetch:
         try:
             repo = Path(git("rev-parse", "--show-toplevel", repo=args.repo)).resolve()
         except subprocess.CalledProcessError as e:
             raise SystemExit(f"目标路径不是 git 仓库: {args.repo}") from e
-        fetch_remotes(repo)
+        local_only_tags = fetch_remotes(repo)
 
     cfg = build_config(args)
+    cfg.local_only_tags = local_only_tags
     print(f"Window: commits since {cfg.since}")
 
     commits  = load_commits(cfg)
@@ -1578,6 +1719,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Nodes kept     : {len(nodes)}")
     print(f"Segments       : {len(segments)}")
     print(f"Output         : {cfg.output}")
+
+    if args.open:
+        open_output(cfg.output)
 
 
 if __name__ == "__main__":
