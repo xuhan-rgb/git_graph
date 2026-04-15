@@ -1538,13 +1538,40 @@ def _get_commit_ts(sha: str, repo: Path) -> int:
         return 0
 
 
+def _get_tag_ts(sha: str, repo: Path) -> int:
+    """返回 tag 被打出的时间戳。
+
+    Annotated tag 有独立的 taggerdate（即 git tag -a 时的时刻），优先使用。
+    Lightweight tag 没有 tag object，退回到 commit 时间戳。
+    """
+    try:
+        obj_type = subprocess.run(
+            ["git", "cat-file", "-t", sha],
+            check=True, text=True, capture_output=True, cwd=str(repo),
+        ).stdout.strip()
+        if obj_type == "tag":
+            content = subprocess.run(
+                ["git", "cat-file", "-p", sha],
+                check=True, text=True, capture_output=True, cwd=str(repo),
+            ).stdout
+            for line in content.split("\n"):
+                if line.startswith("tagger "):
+                    # "tagger Name <email> TIMESTAMP TIMEZONE"
+                    parts = line.split()
+                    return int(parts[-2])
+    except (subprocess.CalledProcessError, ValueError, IndexError):
+        pass
+    return _get_commit_ts(sha, repo)
+
+
 def _sync_tags(repo: Path) -> set:
     """与远端同步 tag，返回本地独有（未推送）的 tag 名集合。
 
     本地独有 tag → 不删除，原样保留，返回其名称供 HTML 标记
     两边都有但 SHA 不同：
-      - 远端 commit 更新 → 以远端为准（force 更新本地）
-      - 本地 commit 更新 → 保留本地
+      - 比较 tag 打出的时间（annotated tag 用 taggerdate，lightweight 用 commit date）
+      - 远端 tag 更新 → 以远端为准（force 更新本地）
+      - 本地 tag 更新 → 保留本地
     """
     remotes = get_remotes(repo)
 
@@ -1585,16 +1612,44 @@ def _sync_tags(repo: Path) -> set:
     to_update:  list[str] = []
     to_keep:    list[str] = []
 
+    # 找出本地与远端 SHA 不同的 tag，临时拉取远端 tag object 以便比较 taggerdate
+    conflicting = {
+        tag: remote_tag_sha[tag]
+        for tag in local_tag_sha
+        if tag in remote_tag_sha and remote_tag_sha[tag] != local_tag_sha[tag]
+    }
+    fetched_tmp_refs: list[str] = []
+    for tag, remote_sha in conflicting.items():
+        try:
+            subprocess.run(
+                ["git", "fetch", "origin",
+                 f"refs/tags/{tag}:refs/tmp_remote_tags/{tag}"],
+                check=True, text=True, capture_output=True, cwd=str(repo),
+            )
+            fetched_tmp_refs.append(f"refs/tmp_remote_tags/{tag}")
+        except subprocess.CalledProcessError:
+            pass  # 拉不到就退回 commit 时间戳比较
+
     for tag in sorted(local_tag_sha):
         if tag not in remote_tag_sha:
             local_only.append(tag)                  # 本地独有，不删除
         elif remote_tag_sha[tag] != local_tag_sha[tag]:
-            local_ts  = _get_commit_ts(local_tag_sha[tag], repo)
-            remote_ts = _get_commit_ts(remote_tag_sha[tag], repo)
+            local_ts  = _get_tag_ts(local_tag_sha[tag], repo)
+            remote_ts = _get_tag_ts(remote_tag_sha[tag], repo)
             if remote_ts > local_ts:
-                to_update.append(tag)               # 远端更新 → 覆盖本地
+                to_update.append(tag)               # 远端 tag 更新 → 覆盖本地
             else:
-                to_keep.append(tag)                 # 本地更新 → 保留
+                to_keep.append(tag)                 # 本地 tag 更新 → 保留
+
+    # 清理临时拉取的 remote tag refs
+    for ref in fetched_tmp_refs:
+        try:
+            subprocess.run(
+                ["git", "update-ref", "-d", ref],
+                check=True, capture_output=True, cwd=str(repo),
+            )
+        except subprocess.CalledProcessError:
+            pass
 
     if local_only:
         print(f"Tag sync: {len(local_only)} local-only tag(s) (not on remote, kept):")
