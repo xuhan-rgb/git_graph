@@ -437,8 +437,12 @@ def compute_lanes(
 
 
 def compute_rows(commits: dict[str, Commit], keep: set[str]) -> dict[str, int]:
-    """日期降序 (最新在顶部) + 稳定 tiebreaker。"""
-    ordered = sorted(keep, key=lambda s: (commits[s].date, s), reverse=True)
+    """时间戳降序 (最新在顶部) + 稳定 tiebreaker。
+
+    用 commit timestamp (秒级) 而不是 .date (日级)，避免同一天多个 commit
+    被 SHA 字典序错排——例如 merge 节点被推到当天后续 commit 的上方。
+    """
+    ordered = sorted(keep, key=lambda s: (commits[s].timestamp, s), reverse=True)
     return {sha: i for i, sha in enumerate(ordered)}
 
 
@@ -469,23 +473,46 @@ def compute_reach_branches(
     keep: set[str],
     tips: dict[str, list[str]],
 ) -> dict[str, set[str]]:
-    reach_branches: dict[str, set[str]] = {sha: set() for sha in keep}
-
+    # Phase 1: first-parent walk from each tip → "primary ownership".
+    # A commit is "owned" by branch B only if it lies on B's trunk
+    # (the chain you get by always following the first parent from B's tip).
+    # Merge-introduced ancestors do NOT get the merging branch's label here.
+    primary_owner: dict[str, set[str]] = {sha: set() for sha in commits}
     for tip_sha, names in tips.items():
+        cur: str | None = tip_sha
         seen: set[str] = set()
-        stack = [tip_sha]
-        while stack:
-            cur = stack.pop()
-            if cur in seen:
-                continue
+        while cur is not None and cur not in seen and cur in commits:
             seen.add(cur)
-            if cur in keep:
-                reach_branches[cur].update(names)
-            for p in commits[cur].parents:
-                if p in commits and p not in seen:
-                    stack.append(p)
+            primary_owner[cur].update(names)
+            parents = [p for p in commits[cur].parents if p in commits]
+            cur = parents[0] if parents else None
 
-    return reach_branches
+    # Phase 2: project ownership onto kept commits, with merge propagation.
+    # For a merge commit, we want its branches to also include the labels
+    # of every branch that flows in via any parent — recursively, so that
+    # nested merges (a merge whose parent is itself a merge) propagate too.
+    cache: dict[str, set[str]] = {}
+
+    def branches_of(sha: str) -> set[str]:
+        if sha in cache:
+            return cache[sha]
+        result = set(primary_owner[sha])
+        parents = commits[sha].parents
+        if len(parents) >= 2:
+            # If sha is on some trunk, only 2nd+ parents "introduce" branches
+            # (the 1st parent just continues the trunk and would over-tag).
+            # If sha is itself anonymous (off all trunks), all parents introduce.
+            introducing = parents[1:] if result else parents
+            for p in introducing:
+                if p not in commits:
+                    continue
+                # Anonymous merge ancestors need recursion to surface their
+                # 2nd-parent contributions; trunk parents resolve in O(1).
+                result |= primary_owner[p] or branches_of(p)
+        cache[sha] = result
+        return result
+
+    return {sha: branches_of(sha) for sha in keep}
 
 
 def build_nodes(
